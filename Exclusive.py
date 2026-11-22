@@ -71,8 +71,11 @@ HEADERS = {
     ),
     "Accept": "application/rss+xml, application/xml, text/xml, */*",
 }
+FALLBACK_HEADERS = {
+    "User-Agent": "Mozilla/5.0",
+}
 
-# 검증 완료된 26개 언론사 RSS (종합지는 정치·사회 배제를 위해 경제 섹션 RSS 적용)
+# 검증 완료된 26개 언론사 RSS (종합지는 정치·사회 배제를 위해 경제 섹션/단독 전용 RSS 적용)
 RSS_FEEDS = [
     # Tier 1: 종합(경제 섹션)·경제지 및 통신사
     ("연합뉴스", "https://www.yna.co.kr/rss/economy.xml", False),
@@ -82,12 +85,12 @@ RSS_FEEDS = [
     ("동아일보", "https://rss.donga.com/economy.xml", False),
     ("한국경제", "https://www.hankyung.com/feed/all-news", False),
     ("매일경제", "https://www.mk.co.kr/rss/30000001/", False),
-    # Tier 2: 유력 경제·종합(경제 섹션) 및 양대 IT 일간지
+    # Tier 2: 유력 경제·종합(경제/단독) 및 양대 IT 일간지
     ("전자신문", "https://rss.etnews.com/Section902.xml", False),
     ("디지털타임스", "https://news.google.com/rss/search?q=intitle:%EB%8B%A8%EB%8F%85+site:dt.co.kr&hl=ko&gl=KR&ceid=KR:ko", True),
     ("서울경제", "https://news.google.com/rss/search?q=intitle:%EB%8B%A8%EB%8F%85+site:sedaily.com&hl=ko&gl=KR&ceid=KR:ko", True),
     ("머니투데이", "https://rss.mt.co.kr/mt_news.xml", False),
-    ("한겨레", "https://www.hani.co.kr/rss/economy/", False),
+    ("한겨레", "https://news.google.com/rss/search?q=intitle:%EB%8B%A8%EB%8F%85+site:hani.co.kr&hl=ko&gl=KR&ceid=KR:ko", True),
     ("경향신문", "https://www.khan.co.kr/rss/rssdata/economy_news.xml", False),
     ("한국일보", "https://news.google.com/rss/search?q=intitle:%EB%8B%A8%EB%8F%85+site:hankookilbo.com&hl=ko&gl=KR&ceid=KR:ko", True),
     ("뉴스1", "https://news.google.com/rss/search?q=intitle:%EB%8B%A8%EB%8F%85+site:news1.kr&hl=ko&gl=KR&ceid=KR:ko", True),
@@ -134,7 +137,7 @@ STOCK_COMPANY_KEYWORDS = [
     "아모레퍼시픽", "에이피알", "실리콘투", "삼양식품", "농심", "신세계", "이마트",
     "롯데케미칼", "롯데쇼핑", "GS건설", "대우건설",
     "KB금융", "신한지주", "하나금융", "우리금융", "메리츠금융", "미래에셋증권", "키움증권",
-    "토스", "비바리퍼블리카", "무신사", "두나무", "업비트", "빗썸",
+    "토스뱅크", "토스증권", "토스페이먼츠", "비바리퍼블리카", "무신사", "두나무", "업비트", "빗썸",
     # 글로벌 빅테크·해외 핵심 종목
     "엔비디아", "NVIDIA", "TSMC", "ASML", "오픈AI", "OpenAI", "앤트로픽", "Anthropic",
     "애플", "테슬라", "마이크로소프트", "구글", "알파벳", "아마존", "메타", "브로드컴",
@@ -184,10 +187,25 @@ EXCLUDE_KEYWORDS = [
     # 기타 사회·사건 오탐
     "조류인플루엔자", "조류독감", "살처분", "임대차", "전세사기",
     "마약", "성폭행", "수능", "학폭", "반론보도", "정정보도", "보이스피싱", "암표상",
+    "기아 문제", "기아 사태", "기아 위기", "기아 난민", "토스트",
 ]
 
 EXCLUSIVE_TAG_RE = re.compile(r"[\[\(][^\]\)]*단독[^\]\)]*[\]\)]")
 LEADING_TAG_RE = re.compile(r"^\s*(?:[\[\(][^\]\)]*단독[^\]\)]*[\]\)]\s*)+")
+
+# 영문 약어(KT, ARM, ISC 등)는 KTX·PHARMA·DISCOUNT 같은 부분 문자열 오탐을 막기 위해 경계 정규식 사용
+_ASCII_KW_PATTERNS = [
+    re.compile(rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])", re.IGNORECASE)
+    for kw in BIZ_KEYWORDS
+    if kw.isascii()
+]
+_KR_KEYWORDS = [kw for kw in BIZ_KEYWORDS if not kw.isascii()]
+
+
+def matches_biz_keyword(title: str) -> bool:
+    if any(kw in title for kw in _KR_KEYWORDS):
+        return True
+    return any(p.search(title) for p in _ASCII_KW_PATTERNS)
 
 
 def load_history() -> tuple[list[str], list[str]]:
@@ -301,15 +319,23 @@ def is_duplicate_title(clean_title: str, recent_titles: list[str]) -> bool:
     return False
 
 
+def fetch_rss_bytes(rss_url: str) -> bytes | None:
+    for hdr in (HEADERS, FALLBACK_HEADERS):
+        try:
+            resp = requests.get(rss_url, headers=hdr, timeout=10, verify=False)
+            if resp.status_code == 200 and resp.content:
+                return resp.content
+        except Exception:
+            continue
+    return None
+
+
 def fetch_single_feed(press: str, rss_url: str, is_gnews: bool, max_age_minutes: int) -> list[dict]:
     results = []
-    try:
-        resp = requests.get(rss_url, headers=HEADERS, timeout=10, verify=False)
-        if resp.status_code != 200:
-            return results
-        entries = parse_rss_items(resp.content)
-    except Exception:
+    raw = fetch_rss_bytes(rss_url)
+    if not raw:
         return results
+    entries = parse_rss_items(raw)
 
     now_utc = datetime.now(timezone.utc)
     cutoff = now_utc - timedelta(minutes=max_age_minutes)
@@ -322,28 +348,28 @@ def fetch_single_feed(press: str, rss_url: str, is_gnews: bool, max_age_minutes:
         if not EXCLUSIVE_TAG_RE.search(raw_title):
             continue
 
-        # 2. 발행 시각 검증 (과거 기사 도배 차단)
+        # 2. 발행 시각 검증 (시각 누락·과거 기사 도배 원천 차단)
         pub_dt = parse_pub_date(pub_str)
-        if pub_dt is not None and pub_dt < cutoff:
-            continue
-
-        # 3. 제외 키워드 차단
-        if any(ex in raw_title for ex in EXCLUDE_KEYWORDS):
-            continue
-
-        # 4. 기업·자본시장 키워드 필터링 (방식 B)
-        if not any(kw in raw_title for kw in BIZ_KEYWORDS):
+        if pub_dt is None or pub_dt < cutoff:
             continue
 
         cleaned = clean_headline(raw_title, is_gnews)
         if not cleaned:
             continue
 
+        # 3. 제외 키워드 차단
+        if any(ex in cleaned for ex in EXCLUDE_KEYWORDS):
+            continue
+
+        # 4. 기업·자본시장 키워드 필터링 (영문 약어 경계 매칭 포함)
+        if not matches_biz_keyword(cleaned):
+            continue
+
         results.append({
             "press": press,
             "title": cleaned,
             "link": link,
-            "published_at": pub_dt or now_utc,
+            "published_at": pub_dt,
         })
 
     return results
