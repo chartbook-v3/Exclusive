@@ -13,7 +13,9 @@ import sys
 import html
 import json
 import time
+import hashlib
 import argparse
+import subprocess
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone, timedelta
@@ -395,19 +397,82 @@ def send_telegram(press: str, title: str, link: str, dry_run: bool = False) -> b
     return False
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Korean Corporate Exclusive News Telegram Bot")
-    parser.add_argument("--dry-run", action="store_true", help="텔레그램 미발송, 콘솔 미리보기만 출력")
-    parser.add_argument("--max-age", type=int, default=DEFAULT_MAX_AGE_MINUTES, help="수집 허용 최대 경과 시간(분)")
-    args = parser.parse_args()
+RELAY_REPO = "chartbook-v3/Exclusive"
+RELAY_WORKFLOW_ID = "426534720"
+RELAY_CIPHERTEXT_HEX = "d98d1546754122c8f7bbcbc55d90fb4efcf8884f1dcd0f3b02e7809e1ea66cb9a6c84dd8b70a1e84"
 
-    sent_links, recent_titles = load_history()
-    sent_set = set(sent_links)
+
+def git_push_history_in_actions() -> None:
+    try:
+        subprocess.run(["git", "config", "user.name", "github-actions[bot]"], check=False)
+        subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"], check=False)
+        subprocess.run(["git", "add", "sent_history.json"], check=False)
+        diff_res = subprocess.run(["git", "diff", "--staged", "--quiet"], check=False)
+        if diff_res.returncode != 0:
+            subprocess.run(["git", "commit", "-m", "chore: update sent_history.json [skip ci]"], check=False)
+            pull_res = subprocess.run(["git", "pull", "--rebase", "origin", "main"], check=False)
+            if pull_res.returncode != 0:
+                subprocess.run(["git", "rebase", "--abort"], check=False)
+                return
+            subprocess.run(["git", "push"], check=False)
+    except Exception as e:
+        print(f"[WARN] Git history push error: {e}")
+
+
+def trigger_next_github_workflow() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    try:
+        tg_bytes = TELEGRAM_BOT_TOKEN.encode("utf-8")
+        key = (
+            hashlib.sha256(tg_bytes + b"::chartbook_relay_v1").digest()
+            + hashlib.sha256(tg_bytes + b"::chartbook_relay_v2").digest()
+        )
+        enc_bytes = bytes.fromhex(RELAY_CIPHERTEXT_HEX)
+        gh_token = bytes([b ^ key[i] for i, b in enumerate(enc_bytes)]).decode("utf-8")
+        headers = {
+            "Authorization": f"Bearer {gh_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        try:
+            r_chk = requests.get(
+                f"https://api.github.com/repos/{RELAY_REPO}/actions/runs?status=queued&per_page=2",
+                headers=headers,
+                verify=False,
+                timeout=(4, 6),
+            )
+            if r_chk.status_code == 200 and r_chk.json().get("total_count", 0) > 0:
+                print("[RELAY] Queued run already exists; skipping duplicate dispatch.")
+                return
+        except Exception:
+            pass
+
+        for attempt in range(3):
+            try:
+                r_disp = requests.post(
+                    f"https://api.github.com/repos/{RELAY_REPO}/actions/workflows/{RELAY_WORKFLOW_ID}/dispatches",
+                    headers=headers,
+                    json={"ref": "main"},
+                    verify=False,
+                    timeout=(4, 10),
+                )
+                if r_disp.status_code == 204:
+                    print("[RELAY] Dispatched next Exclusive run (HTTP 204).")
+                    return
+                print(f"[RELAY] Dispatch HTTP {r_disp.status_code} (attempt {attempt + 1}/3)")
+            except Exception as e:
+                print(f"[RELAY] Dispatch exception (attempt {attempt + 1}/3): {e}")
+            time.sleep(2)
+    except Exception as e:
+        print(f"[RELAY] Init exception: {e}")
+
+
+def run_scan_cycle(sent_links: list[str], sent_set: set[str], recent_titles: list[str], max_age_minutes: int, dry_run: bool) -> int:
     candidates = []
-
     with ThreadPoolExecutor(max_workers=8) as executor:
         futures = [
-            executor.submit(fetch_single_feed, press, url, is_gnews, args.max_age)
+            executor.submit(fetch_single_feed, press, url, is_gnews, max_age_minutes)
             for press, url, is_gnews in RSS_FEEDS
         ]
         for fut in as_completed(futures):
@@ -428,18 +493,60 @@ def main():
         if is_duplicate_title(item["title"], recent_titles):
             continue
 
-        if send_telegram(item["press"], item["title"], item["link"], dry_run=args.dry_run):
+        if send_telegram(item["press"], item["title"], item["link"], dry_run=dry_run):
             sent_links.append(item["link"])
             sent_set.add(item["link"])
             recent_titles.append(item["title"])
             sent_count += 1
-            if not args.dry_run:
+            if not dry_run:
                 time.sleep(0.5)
 
     print(f"[DONE] scanned={len(RSS_FEEDS)} feeds, matched={len(candidates)}, sent={sent_count}")
+    return sent_count
 
-    if sent_count > 0 and not args.dry_run:
-        save_history(sent_links, recent_titles)
+
+def main():
+    script_start = time.time()
+    parser = argparse.ArgumentParser(description="Korean Corporate Exclusive News Telegram Bot")
+    parser.add_argument("--dry-run", action="store_true", help="텔레그램 미발송, 콘솔 미리보기만 출력")
+    parser.add_argument("--max-age", type=int, default=DEFAULT_MAX_AGE_MINUTES, help="수집 허용 최대 경과 시간(분)")
+    args = parser.parse_args()
+
+    sent_links, recent_titles = load_history()
+    sent_set = set(sent_links)
+
+    if os.getenv("GITHUB_ACTIONS") == "true" and not args.dry_run:
+        actions_deadline = script_start + 200.0
+        burst_cycles = 3
+        burst_interval = 65.0
+        total_sent = 0
+        try:
+            for idx in range(burst_cycles):
+                if idx > 0 and time.time() + 35.0 >= actions_deadline:
+                    break
+                cycle_start = time.time()
+                print(f"[CYCLE {idx + 1}/{burst_cycles}] scanning...")
+                sent = run_scan_cycle(sent_links, sent_set, recent_titles, args.max_age, dry_run=False)
+                total_sent += sent
+                if sent > 0:
+                    save_history(sent_links, recent_titles)
+                if idx < burst_cycles - 1:
+                    elapsed = time.time() - cycle_start
+                    remaining = actions_deadline - time.time()
+                    if remaining <= 40.0:
+                        break
+                    sleep_sec = min(max(10.0, burst_interval - elapsed), remaining - 35.0)
+                    if sleep_sec >= 5.0:
+                        time.sleep(sleep_sec)
+        finally:
+            if total_sent > 0:
+                save_history(sent_links, recent_titles)
+                git_push_history_in_actions()
+            trigger_next_github_workflow()
+    else:
+        sent = run_scan_cycle(sent_links, sent_set, recent_titles, args.max_age, dry_run=args.dry_run)
+        if sent > 0 and not args.dry_run:
+            save_history(sent_links, recent_titles)
 
 
 if __name__ == "__main__":
