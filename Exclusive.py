@@ -463,14 +463,28 @@ def trigger_next_github_workflow() -> None:
         }
         try:
             r_chk = requests.get(
-                f"https://api.github.com/repos/{RELAY_REPO}/actions/runs?status=queued&per_page=2",
+                f"https://api.github.com/repos/{RELAY_REPO}/actions/runs?status=queued&per_page=10",
                 headers=headers,
                 verify=False,
                 timeout=(4, 6),
             )
-            if r_chk.status_code == 200 and r_chk.json().get("total_count", 0) > 0:
-                print("[RELAY] Queued run already exists; skipping duplicate dispatch.")
-                return
+            if r_chk.status_code == 200:
+                now_utc = datetime.now(timezone.utc)
+                has_fresh_queued = False
+                for q_run in r_chk.json().get("workflow_runs", []):
+                    ca = q_run.get("created_at")
+                    if not ca:
+                        continue
+                    try:
+                        ca_dt = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+                        if (now_utc - ca_dt).total_seconds() < 600:
+                            has_fresh_queued = True
+                            break
+                    except Exception:
+                        pass
+                if has_fresh_queued:
+                    print("[RELAY] Queued run already exists; skipping duplicate dispatch.")
+                    return
         except Exception:
             pass
 
